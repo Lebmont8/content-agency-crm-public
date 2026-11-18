@@ -1,0 +1,65 @@
+{
+  "name": "content-agency-crm-public",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "prisma generate && next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "worker:outbox": "node --conditions=react-server --import tsx scripts/outbox-worker.ts",
+    "worker:outbox:once": "node --conditions=react-server --import tsx scripts/outbox-worker.ts --once",
+    "worker:inbound": "node --conditions=react-server --import tsx scripts/inbound-worker.ts",
+    "worker:inbound:once": "node --conditions=react-server --import tsx scripts/inbound-worker.ts --once",
+    "worker:notifications": "node --conditions=react-server --import tsx scripts/notification-worker.ts",
+    "worker:notifications:once": "node --conditions=react-server --import tsx scripts/notification-worker.ts --once",
+    "db:migrate": "prisma migrate deploy",
+    "db:bootstrap": "node --env-file=.env --conditions=react-server --import tsx scripts/bootstrap-owner.ts"
+  },
+  "overrides": {
+    "@prisma/config@6.19.3": {
+      "deepmerge-ts": "8.0.0"
+    },
+    "brace-expansion": "5.0.9",
+    "postcss": "8.5.26",
+    "sharp": "0.35.5",
+    "source-map-js": "1.2.2"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "bcryptjs": "^3.0.3",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.23.0",
+    "next": "15.5.28",
+    "otplib": "^13.4.1",
+    "qrcode": "^1.5.4",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "recharts": "^3.9.2",
+    "server-only": "^0.0.1",
+    "tailwind-merge": "^3.6.0",
+    "zod": "4.6.6"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@playwright/test": "^1.61.1",
+    "@tailwindcss/postcss": "^4",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^20",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "15.5.28",
+    "prisma": "^6.19.3",
+    "tailwindcss": "^4",
+    "tsx": "^4.23.0",
+    "typescript": "^5",
+    "vite-tsconfig-paths": "^6.1.1",
+    "vitest": "^4.1.9"
+  }
+}

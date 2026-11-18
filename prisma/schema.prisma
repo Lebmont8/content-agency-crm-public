@@ -1,0 +1,1543 @@
+// Multi-tenant CRM for content-platform agencies.
+// EVERY domain table carries `agencyId` — tenant isolation is enforced by the
+// data-access wrapper in src/lib/tenant-db.ts. Do not query Prisma directly
+// from route handlers / server actions; use getTenantDb(agencyId).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tenancy, users, auth
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum AgencyStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum PilotMode {
+  OFF
+  SHADOW
+  ASSIST
+  AUTO
+}
+
+model Agency {
+  id                      String       @id @default(cuid())
+  name                    String
+  slug                    String       @unique
+  // Platform-operator kill switch: SUSPENDED locks the agency out of the app
+  // and disables AI/sending (e.g. for non-payment). Flipped from /admin.
+  status                  AgencyStatus @default(ACTIVE)
+  // Per-agency pricing (defaults; the operator can override per agency for
+  // barter/custom deals from /admin). Percents are whole numbers.
+  commissionAssistPercent Int          @default(7)
+  commissionAutoPercent   Int          @default(9)
+  perModelFeeCents        Int          @default(5000) // $50 / model / 14 days
+  // Payment tracking. Automatic chain verification is fail-closed and may be
+  // supplemented by explicit platform-operator confirmation.
+  // dueDate = when the current 14-day invoice is due; paymentPending = the
+  // owner clicked "I paid" and is awaiting operator confirmation.
+  dueDate                 DateTime?
+  paymentPending          Boolean      @default(false)
+  // Separate live-pilot kill switch. Billing activation never enables live
+  // platform/LLM traffic by itself; the platform operator must opt in.
+  pilotEnabled            Boolean      @default(false)
+  createdAt               DateTime     @default(now())
+
+  users                    User[]
+  trustedDevices           TrustedDevice[]
+  invitations              Invitation[]
+  creatorAccounts          CreatorAccount[]
+  platformConnections      PlatformConnection[]
+  platformCredentials      PlatformCredential[]
+  desktopConnectorDevices  DesktopConnectorDevice[]
+  desktopConnectorProfiles DesktopConnectorProfile[]
+  desktopConnectorRequests DesktopConnectorRequest[]
+  desktopConnectorCommands DesktopConnectorCommand[]
+  inboundEvents            InboundEvent[]
+  agentRuns                AgentRun[]
+  agentActions             AgentAction[]
+  salesEvents              SalesEvent[]
+  followUpJobs             FollowUpJob[]
+  internalNotifications    InternalNotification[]
+  creatorSalesProfiles     CreatorSalesProfile[]
+  aiUsageDaily             AiUsageDaily[]
+  outboundDeliveries       OutboundDelivery[]
+  outboundAttempts         OutboundDeliveryAttempt[]
+  assignments              ChatterAssignment[]
+  shifts                   Shift[]
+  fans                     Fan[]
+  fanNotes                 FanNote[]
+  fanTags                  FanTag[]
+  fanTagLinks              FanTagLink[]
+  conversations            Conversation[]
+  messages                 Message[]
+  transactions             Transaction[]
+  vaultItems               VaultItem[]
+  vaultSends               VaultSend[]
+  saasSubscription         SaasSubscription?
+  billingRecords           BillingRecord[]
+  cryptoPayments           CryptoPayment[]
+  vaultPriceGroups         VaultPriceGroup[]
+  notificationPreferences  UserNotificationPreference[]
+  contentRequests          ContentRequest[]
+  notificationDeliveries   NotificationDelivery[]
+  mfaCredentials           UserMfaCredential[]
+  mfaRecoveryCodes         MfaRecoveryCode[]
+  mfaChallenges            MfaChallenge[]
+}
+
+// Global pre-auth throttle. The identifier is a SHA-256 digest of the
+// normalized login email; raw emails and IP addresses are never stored here.
+model LoginThrottle {
+  identifierHash  String    @id
+  attemptCount    Int       @default(0)
+  windowStartedAt DateTime
+  blockedUntil    DateTime?
+  updatedAt       DateTime  @updatedAt
+
+  @@index([blockedUntil])
+}
+
+enum Role {
+  OWNER
+  MANAGER
+  CHATTER
+}
+
+enum MfaChallengePurpose {
+  SETUP
+  LOGIN
+}
+
+model User {
+  id              String   @id @default(cuid())
+  agencyId        String
+  email           String   @unique
+  passwordHash    String
+  name            String
+  role            Role
+  isActive        Boolean  @default(true)
+  // Platform operator (you) — cross-agency admin access to /admin, above the
+  // per-agency roles. Not an agency role.
+  isPlatformAdmin Boolean  @default(false)
+  createdAt       DateTime @default(now())
+
+  agency                            Agency                       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  sessions                          Session[]
+  assignments                       ChatterAssignment[]
+  shifts                            Shift[]
+  fanNotes                          FanNote[]
+  sentMessages                      Message[]                    @relation("MessageSender")
+  transactions                      Transaction[]                @relation("TransactionCloser")
+  vaultSends                        VaultSend[]
+  invitesSent                       Invitation[]                 @relation("InvitedBy")
+  assignedConversations             Conversation[]               @relation("ConversationAssignee")
+  requestedHandoffs                 Conversation[]               @relation("ConversationHandoffRequester")
+  internalNotifications             InternalNotification[]       @relation("InternalNotificationRecipient")
+  notificationPreferences           UserNotificationPreference[]
+  assignedContentRequests           ContentRequest[]             @relation("ContentRequestAssignee")
+  telegramNotificationChatId        String?
+  telegramNotificationVerifiedAt    DateTime?
+  telegramNotificationPairingHash   String?
+  telegramNotificationPairingExpiry DateTime?
+  mfaCredential                     UserMfaCredential?
+  mfaChallenges                     MfaChallenge[]
+  trustedDevices                    TrustedDevice[]
+  pairedConnectorDevices            DesktopConnectorDevice[]     @relation("DesktopConnectorDevicePairedBy")
+
+  @@unique([agencyId, id])
+  @@index([agencyId])
+}
+
+model UserMfaCredential {
+  id               String    @id @default(cuid())
+  agencyId         String
+  userId           String
+  secretCiphertext String    @db.Text
+  secretIv         String
+  secretAuthTag    String
+  keyVersion       Int       @default(1)
+  enabledAt        DateTime?
+  lastAcceptedStep BigInt?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  agency        Agency            @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user          User              @relation(fields: [agencyId, userId], references: [agencyId, id], onDelete: Cascade)
+  recoveryCodes MfaRecoveryCode[]
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, userId])
+  @@index([agencyId, enabledAt])
+}
+
+model MfaRecoveryCode {
+  id           String    @id @default(cuid())
+  agencyId     String
+  credentialId String
+  codeHash     String
+  usedAt       DateTime?
+  createdAt    DateTime  @default(now())
+
+  agency     Agency            @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  credential UserMfaCredential @relation(fields: [agencyId, credentialId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, credentialId, codeHash])
+  @@index([agencyId, credentialId, usedAt])
+}
+
+model MfaChallenge {
+  id             String              @id @default(cuid())
+  agencyId       String
+  userId         String
+  tokenHash      String              @unique
+  purpose        MfaChallengePurpose
+  rememberDevice Boolean             @default(false)
+  attemptCount   Int                 @default(0)
+  maxAttempts    Int                 @default(5)
+  expiresAt      DateTime
+  consumedAt     DateTime?
+  createdAt      DateTime            @default(now())
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [agencyId, userId], references: [agencyId, id], onDelete: Cascade)
+
+  @@index([agencyId, userId, expiresAt])
+  @@index([expiresAt])
+}
+
+model TrustedDevice {
+  id         String    @id @default(cuid())
+  agencyId   String
+  userId     String
+  tokenHash  String    @unique
+  label      String
+  expiresAt  DateTime
+  lastUsedAt DateTime  @default(now())
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+
+  agency   Agency    @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user     User      @relation(fields: [agencyId, userId], references: [agencyId, id], onDelete: Cascade)
+  sessions Session[]
+
+  @@unique([agencyId, id])
+  @@index([agencyId, userId, revokedAt, expiresAt])
+  @@index([expiresAt])
+}
+
+model Session {
+  id              String   @id @default(cuid())
+  tokenHash       String   @unique
+  userId          String
+  trustedDeviceId String?
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trustedDevice TrustedDevice? @relation(fields: [trustedDeviceId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([trustedDeviceId])
+}
+
+model Invitation {
+  id          String    @id @default(cuid())
+  agencyId    String
+  email       String
+  role        Role
+  tokenHash   String    @unique
+  invitedById String
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  agency    Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  invitedBy User   @relation("InvitedBy", fields: [agencyId, invitedById], references: [agencyId, id], onDelete: Cascade)
+
+  @@index([agencyId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Creator accounts, assignments, shifts
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum AccountStatus {
+  ACTIVE
+  PAUSED
+  DISCONNECTED
+}
+
+enum PlatformAuthMethod {
+  MOCK
+  TELEGRAM_BOT
+  FANVUE_OAUTH
+  FANSLY_MANAGEMENT_SESSION
+  ONLYFANS_DESKTOP_SESSION
+}
+
+enum PlatformConnectionStatus {
+  DRAFT
+  AUTHORIZING
+  VERIFYING
+  SYNCING
+  ACTIVE
+  REAUTH_REQUIRED
+  REVOKED
+  ERROR
+}
+
+enum DesktopConnectorDeviceStatus {
+  PAIRING
+  ACTIVE
+  REVOKED
+}
+
+enum DesktopConnectorProfileStatus {
+  LOCKED
+  READY
+  REAUTH_REQUIRED
+  REVOKED
+  ERROR
+}
+
+enum DesktopConnectorCommandKind {
+  VERIFY_PROFILE
+  SYNC_SNAPSHOT
+  SEND_TEXT
+}
+
+enum DesktopConnectorCommandStatus {
+  PENDING
+  LEASED
+  SUCCEEDED
+  FAILED
+  CANCELED
+}
+
+model CreatorAccount {
+  id                     String        @id @default(cuid())
+  agencyId               String
+  displayName            String
+  platform               String // "mock" | "telegram" | "fanvue" | "onlyfans" | "fansly"
+  // Opaque local reference that identifies the account to its connector.
+  // Sensitive credentials never live in this database: PlatformConnection
+  // stores only a reference to an external secrets manager entry.
+  externalAccountRef     String
+  status                 AccountStatus @default(ACTIVE)
+  // Billing gate: a new model is NOT activated until its 14-day fee is paid
+  // and the operator confirms. Unactivated models don't work (no inbox/AI).
+  activated              Boolean       @default(false)
+  // When true, the AI copilot auto-replies to incoming messages on this
+  // account; a chatter supervises and can toggle it off to take over.
+  aiAutoReply            Boolean       @default(false)
+  // Fail-closed rollout for real connectors/LLMs. Mock remains available for
+  // deterministic development without weakening these production gates.
+  pilotMode              PilotMode     @default(OFF)
+  complianceApprovedAt   DateTime?
+  dailyAiRunLimit        Int           @default(0)
+  dailyAiCostLimitMicros Int           @default(0)
+  createdAt              DateTime      @default(now())
+
+  agency                  Agency                       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  assignments             ChatterAssignment[]
+  fans                    Fan[]
+  conversations           Conversation[]
+  transactions            Transaction[]
+  vaultItems              VaultItem[]
+  shifts                  Shift[]
+  connection              PlatformConnection?
+  outboundDeliveries      OutboundDelivery[]
+  salesProfile            CreatorSalesProfile?
+  followUpJobs            FollowUpJob[]
+  aiUsageDaily            AiUsageDaily[]
+  desktopConnectorProfile DesktopConnectorProfile?
+  vaultPriceGroups        VaultPriceGroup[]
+  notificationPreferences UserNotificationPreference[]
+  contentRequests         ContentRequest[]
+  internalNotifications   InternalNotification[]
+
+  @@unique([agencyId, id])
+  @@index([agencyId])
+  @@index([agencyId, pilotMode])
+}
+
+model AiUsageDaily {
+  id               String   @id @default(cuid())
+  agencyId         String
+  creatorAccountId String
+  usageDate        DateTime @db.Date
+  runCount         Int      @default(0)
+  costMicros       Int      @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  agency         Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount CreatorAccount @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, creatorAccountId, usageDate])
+  @@index([agencyId, usageDate])
+}
+
+model PlatformConnection {
+  id                String                   @id @default(cuid())
+  agencyId          String
+  creatorAccountId  String
+  platform          String
+  authMethod        PlatformAuthMethod
+  status            PlatformConnectionStatus @default(DRAFT)
+  remoteAccountId   String?
+  secretRef         String? // secrets-manager reference, never a raw token/session
+  grantedScopes     String[]                 @default([])
+  capabilities      String[]                 @default([])
+  lastVerifiedAt    DateTime?
+  lastSyncStartedAt DateTime?
+  lastSyncedAt      DateTime?
+  syncLeaseOwner    String?
+  syncLeaseUntil    DateTime?
+  expiresAt         DateTime?
+  lastErrorCode     String?
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+
+  agency                  Agency                   @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount          CreatorAccount           @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  credential              PlatformCredential?
+  inboundEvents           InboundEvent[]
+  outboundDeliveries      OutboundDelivery[]
+  followUpJobs            FollowUpJob[]
+  desktopConnectorProfile DesktopConnectorProfile?
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, creatorAccountId])
+  @@unique([platform, remoteAccountId])
+  @@index([agencyId, status])
+  @@index([agencyId, status, syncLeaseUntil])
+}
+
+model PlatformCredential {
+  id                String    @id @default(cuid())
+  agencyId          String
+  connectionId      String
+  ciphertext        String    @db.Text
+  iv                String
+  authTag           String
+  keyVersion        Int       @default(1)
+  version           Int       @default(1)
+  refreshLeaseOwner String?
+  refreshLeaseUntil DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  agency     Agency             @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  connection PlatformConnection @relation(fields: [agencyId, connectionId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, connectionId])
+  @@index([agencyId])
+}
+
+// Platform-neutral desktop connector control plane. The CRM stores only
+// public device identity, hashed one-time/bearer tokens and opaque profile
+// bindings. Browser sessions and provider credentials remain encrypted on the
+// paired device and never enter this database.
+model DesktopConnectorDevice {
+  id               String                       @id @default(cuid())
+  agencyId         String
+  pairedByUserId   String
+  status           DesktopConnectorDeviceStatus @default(PAIRING)
+  label            String
+  pairingCodeHash  String?                      @unique
+  pairingExpiresAt DateTime?
+  tokenHash        String?                      @unique
+  publicKeySpki    String?                      @db.Text
+  protocolVersion  Int?
+  appVersion       String?
+  pairedAt         DateTime?
+  lastSeenAt       DateTime?
+  revokedAt        DateTime?
+  createdAt        DateTime                     @default(now())
+  updatedAt        DateTime                     @updatedAt
+
+  agency   Agency                    @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  pairedBy User                      @relation("DesktopConnectorDevicePairedBy", fields: [agencyId, pairedByUserId], references: [agencyId, id], onDelete: Restrict)
+  profiles DesktopConnectorProfile[]
+  requests DesktopConnectorRequest[]
+  commands DesktopConnectorCommand[]
+
+  @@unique([agencyId, id])
+  @@index([agencyId, status, lastSeenAt])
+  @@index([pairingExpiresAt])
+}
+
+model DesktopConnectorProfile {
+  id               String                        @id @default(cuid())
+  agencyId         String
+  deviceId         String
+  creatorAccountId String
+  connectionId     String
+  platform         String
+  status           DesktopConnectorProfileStatus @default(LOCKED)
+  lastVerifiedAt   DateTime?
+  lastErrorCode    String?
+  createdAt        DateTime                      @default(now())
+  updatedAt        DateTime                      @updatedAt
+
+  agency         Agency                    @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  device         DesktopConnectorDevice    @relation(fields: [agencyId, deviceId], references: [agencyId, id], onDelete: Cascade)
+  creatorAccount CreatorAccount            @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  connection     PlatformConnection        @relation(fields: [agencyId, connectionId], references: [agencyId, id], onDelete: Cascade)
+  commands       DesktopConnectorCommand[]
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, creatorAccountId])
+  @@unique([agencyId, connectionId])
+  @@index([agencyId, deviceId, status])
+}
+
+model DesktopConnectorRequest {
+  id            String   @id @default(cuid())
+  agencyId      String
+  deviceId      String
+  requestId     String
+  kind          String
+  requestDigest String
+  receivedAt    DateTime @default(now())
+  expiresAt     DateTime
+
+  agency Agency                 @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  device DesktopConnectorDevice @relation(fields: [agencyId, deviceId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, id])
+  @@unique([deviceId, requestId])
+  @@index([agencyId, expiresAt])
+}
+
+model DesktopConnectorCommand {
+  id                    String                        @id @default(cuid())
+  agencyId              String
+  deviceId              String
+  profileId             String
+  outboundDeliveryId    String?
+  outboundAttemptNumber Int?
+  kind                  DesktopConnectorCommandKind
+  status                DesktopConnectorCommandStatus @default(PENDING)
+  idempotencyKey        String
+  attemptCount          Int                           @default(0)
+  maxAttempts           Int                           @default(5)
+  nextAttemptAt         DateTime                      @default(now())
+  leaseOwner            String?
+  leaseUntil            DateTime?
+  resultDigest          String?
+  lastErrorCode         String?
+  completedAt           DateTime?
+  createdAt             DateTime                      @default(now())
+  updatedAt             DateTime                      @updatedAt
+
+  agency           Agency                  @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  device           DesktopConnectorDevice  @relation(fields: [agencyId, deviceId], references: [agencyId, id], onDelete: Cascade)
+  profile          DesktopConnectorProfile @relation(fields: [agencyId, profileId], references: [agencyId, id], onDelete: Cascade)
+  outboundDelivery OutboundDelivery?       @relation(fields: [agencyId, outboundDeliveryId], references: [agencyId, id], onDelete: Restrict)
+
+  @@unique([agencyId, id])
+  @@unique([deviceId, idempotencyKey])
+  @@index([agencyId, deviceId, status, nextAttemptAt])
+  @@index([agencyId, outboundDeliveryId, outboundAttemptNumber])
+  @@index([leaseUntil])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Durable inbound events
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum InboundEventStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  RETRY
+  DLQ
+}
+
+model InboundEvent {
+  id              String             @id @default(cuid())
+  agencyId        String
+  connectionId    String
+  providerEventId String
+  type            String
+  payload         Json
+  occurredAt      DateTime
+  status          InboundEventStatus @default(PENDING)
+  attemptCount    Int                @default(0)
+  maxAttempts     Int                @default(5)
+  nextAttemptAt   DateTime           @default(now())
+  leaseOwner      String?
+  leaseUntil      DateTime?
+  lastErrorCode   String?
+  lastErrorAt     DateTime?
+  processedAt     DateTime?
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+
+  agency     Agency             @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  connection PlatformConnection @relation(fields: [agencyId, connectionId], references: [agencyId, id], onDelete: Cascade)
+  agentRun   AgentRun?
+
+  @@unique([connectionId, providerEventId])
+  @@unique([agencyId, id])
+  @@index([agencyId, status, nextAttemptAt])
+  @@index([status, nextAttemptAt])
+  @@index([leaseUntil])
+}
+
+model ChatterAssignment {
+  id               String   @id @default(cuid())
+  agencyId         String
+  userId           String
+  creatorAccountId String
+  createdAt        DateTime @default(now())
+
+  agency         Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user           User           @relation(fields: [agencyId, userId], references: [agencyId, id], onDelete: Cascade)
+  creatorAccount CreatorAccount @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([userId, creatorAccountId])
+  @@index([agencyId])
+}
+
+model Shift {
+  id               String    @id @default(cuid())
+  agencyId         String
+  userId           String
+  creatorAccountId String?
+  startedAt        DateTime  @default(now())
+  endedAt          DateTime?
+  // Aggregates are denormalized on shift end for fast KPI queries.
+  revenueCents     Int       @default(0)
+  ppvSentCount     Int       @default(0)
+  ppvClosedCount   Int       @default(0)
+
+  agency         Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user           User            @relation(fields: [agencyId, userId], references: [agencyId, id], onDelete: Cascade)
+  creatorAccount CreatorAccount? @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Restrict)
+  transactions   Transaction[]
+
+  @@unique([agencyId, id])
+  @@index([agencyId])
+  @@index([userId, endedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fans, conversations, messages
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+}
+
+enum SalesStage {
+  NEW
+  DISCOVERY
+  QUALIFIED
+  WARMING
+  OFFERED
+  OBJECTION
+  CLOSING
+  WON
+  HANDOFF
+  PAUSED
+  LOST
+}
+
+enum ControlMode {
+  HUMAN
+  ASSIST
+  AUTO
+}
+
+enum HandoffStatus {
+  REQUESTED
+  TAKEN_OVER
+}
+
+enum InternalNotificationType {
+  HANDOFF_REQUESTED
+  HANDOFF_TAKEN_OVER
+  HANDOFF_RESUMED
+  CUSTOM_CONTENT_REQUEST
+  NEW_LEAD
+  LARGE_PURCHASE
+  INTEGRATION_ERROR
+  AI_ERROR
+  BILLING_DUE
+  AI_SUSPENDED
+}
+
+model Fan {
+  id                  String             @id @default(cuid())
+  agencyId            String
+  creatorAccountId    String
+  externalFanRef      String
+  username            String
+  displayName         String
+  totalSpentCents     Int                @default(0)
+  subscribedAt        DateTime
+  lastActiveAt        DateTime
+  subscriptionStatus  SubscriptionStatus @default(ACTIVE)
+  contactOptOutAt     DateTime?
+  contactOptOutReason String?
+
+  agency             Agency             @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount     CreatorAccount     @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  notes              FanNote[]
+  tagLinks           FanTagLink[]
+  conversations      Conversation[]
+  transactions       Transaction[]
+  vaultSends         VaultSend[]
+  outboundDeliveries OutboundDelivery[]
+
+  @@unique([creatorAccountId, externalFanRef])
+  @@unique([agencyId, id])
+  @@index([agencyId])
+  @@index([creatorAccountId, totalSpentCents])
+}
+
+model FanNote {
+  id        String   @id @default(cuid())
+  agencyId  String
+  fanId     String
+  authorId  String
+  body      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  fan    Fan    @relation(fields: [agencyId, fanId], references: [agencyId, id], onDelete: Cascade)
+  author User   @relation(fields: [agencyId, authorId], references: [agencyId, id], onDelete: Cascade)
+
+  @@index([agencyId])
+  @@index([fanId])
+}
+
+model FanTag {
+  id       String @id @default(cuid())
+  agencyId String
+  name     String
+  color    String @default("#8b5cf6")
+
+  agency Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  links  FanTagLink[]
+
+  @@unique([agencyId, name])
+  @@unique([agencyId, id])
+}
+
+model FanTagLink {
+  id       String @id @default(cuid())
+  agencyId String
+  fanId    String
+  tagId    String
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  fan    Fan    @relation(fields: [agencyId, fanId], references: [agencyId, id], onDelete: Cascade)
+  tag    FanTag @relation(fields: [agencyId, tagId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([fanId, tagId])
+  @@index([agencyId])
+}
+
+model Conversation {
+  id                       String         @id @default(cuid())
+  agencyId                 String
+  creatorAccountId         String
+  fanId                    String
+  lastMessageAt            DateTime       @default(now())
+  unreadCount              Int            @default(0)
+  controlMode              ControlMode    @default(HUMAN)
+  salesStage               SalesStage     @default(NEW)
+  memorySummary            String?        @db.Text
+  intent                   String?        @db.Text
+  budgetCents              Int?
+  interests                String[]       @default([])
+  objections               String[]       @default([])
+  promises                 String[]       @default([])
+  nextActionAt             DateTime?
+  handoffStatus            HandoffStatus?
+  handoffRequestId         String?
+  handoffReason            String?
+  handoffRequestedAt       DateTime?
+  handoffSlaDueAt          DateTime?
+  handoffRequestedByUserId String?
+  assignedUserId           String?
+  takenOverAt              DateTime?
+  resumeMode               ControlMode?
+  resumeSalesStage         SalesStage?
+
+  agency                Agency                 @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount        CreatorAccount         @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  fan                   Fan                    @relation(fields: [agencyId, fanId], references: [agencyId, id], onDelete: Cascade)
+  assignedUser          User?                  @relation("ConversationAssignee", fields: [agencyId, assignedUserId], references: [agencyId, id], onDelete: Restrict)
+  handoffRequestedBy    User?                  @relation("ConversationHandoffRequester", fields: [agencyId, handoffRequestedByUserId], references: [agencyId, id], onDelete: Restrict)
+  messages              Message[]
+  agentRuns             AgentRun[]
+  agentActions          AgentAction[]
+  salesEvents           SalesEvent[]
+  followUpJobs          FollowUpJob[]
+  internalNotifications InternalNotification[]
+  contentRequests       ContentRequest[]
+  outboundDeliveries    OutboundDelivery[]
+
+  @@unique([creatorAccountId, fanId])
+  @@unique([agencyId, id])
+  @@unique([agencyId, handoffRequestId])
+  @@index([agencyId])
+  @@index([creatorAccountId, lastMessageAt])
+  @@index([agencyId, salesStage, nextActionAt])
+  @@index([agencyId, assignedUserId])
+  @@index([agencyId, handoffStatus, handoffSlaDueAt])
+}
+
+model InternalNotification {
+  id               String                   @id @default(cuid())
+  agencyId         String
+  recipientUserId  String
+  conversationId   String?
+  creatorAccountId String?
+  type             InternalNotificationType
+  dedupeKey        String
+  reason           String?                  @db.Text
+  title            String                   @default("")
+  body             String?                  @db.Text
+  actionPath       String?
+  severity         String                   @default("INFO")
+  readAt           DateTime?
+  createdAt        DateTime                 @default(now())
+
+  agency         Agency                 @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  recipient      User                   @relation("InternalNotificationRecipient", fields: [agencyId, recipientUserId], references: [agencyId, id], onDelete: Cascade)
+  conversation   Conversation?          @relation(fields: [agencyId, conversationId], references: [agencyId, id], onDelete: Cascade)
+  creatorAccount CreatorAccount?        @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  deliveries     NotificationDelivery[]
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, dedupeKey])
+  @@index([agencyId, recipientUserId, readAt, createdAt])
+  @@index([agencyId, conversationId, createdAt])
+  @@index([agencyId, creatorAccountId, createdAt])
+}
+
+enum NotificationDeliveryStatus {
+  PENDING
+  PROCESSING
+  SENT
+  RETRY
+  FAILED
+}
+
+model NotificationDelivery {
+  id             String                     @id @default(cuid())
+  agencyId       String
+  notificationId String
+  channel        String
+  destination    String
+  status         NotificationDeliveryStatus @default(PENDING)
+  attemptCount   Int                        @default(0)
+  nextAttemptAt  DateTime                   @default(now())
+  leaseOwner     String?
+  leaseUntil     DateTime?
+  lastErrorCode  String?
+  sentAt         DateTime?
+  createdAt      DateTime                   @default(now())
+  updatedAt      DateTime                   @updatedAt
+
+  agency       Agency               @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  notification InternalNotification @relation(fields: [agencyId, notificationId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, id])
+  @@unique([notificationId, channel])
+  @@index([agencyId, status, nextAttemptAt])
+}
+
+model UserNotificationPreference {
+  id               String   @id @default(cuid())
+  agencyId         String
+  userId           String
+  creatorAccountId String?
+  scopeKey         String   @default("*")
+  eventType        String
+  inAppEnabled     Boolean  @default(true)
+  telegramEnabled  Boolean  @default(false)
+  deliveryMode     String   @default("IMMEDIATE")
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  agency         Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  user           User            @relation(fields: [agencyId, userId], references: [agencyId, id], onDelete: Cascade)
+  creatorAccount CreatorAccount? @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, userId, scopeKey, eventType])
+  @@unique([agencyId, id])
+  @@index([agencyId, userId])
+  @@index([agencyId, creatorAccountId])
+}
+
+model ContentRequest {
+  id               String    @id @default(cuid())
+  agencyId         String
+  creatorAccountId String
+  conversationId   String
+  sourceMessageId  String?
+  assignedUserId   String?
+  status           String    @default("NEW")
+  summary          String    @db.Text
+  requestedAt      DateTime  @default(now())
+  completedAt      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  agency         Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount CreatorAccount @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  conversation   Conversation   @relation(fields: [agencyId, conversationId], references: [agencyId, id], onDelete: Cascade)
+  assignedUser   User?          @relation("ContentRequestAssignee", fields: [agencyId, assignedUserId], references: [agencyId, id], onDelete: Restrict)
+  sourceMessage  Message?       @relation(fields: [agencyId, sourceMessageId], references: [agencyId, id], onDelete: Restrict)
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, sourceMessageId])
+  @@index([agencyId, status, requestedAt])
+  @@index([agencyId, creatorAccountId, status])
+  @@index([agencyId, assignedUserId, status])
+}
+
+enum MessageDirection {
+  IN
+  OUT
+}
+
+// How the AI was involved in a message/PPV/sale. Drives the tiered commission:
+// ASSIST (AI drafted, a human sent) = 7%, AUTO (AI sent on its own) = 9%.
+enum AiMode {
+  NONE
+  ASSIST
+  AUTO
+}
+
+model Message {
+  id                  String           @id @default(cuid())
+  agencyId            String
+  conversationId      String
+  direction           MessageDirection
+  body                String
+  // Which chatter sent an OUT message (null for IN, AI-auto-sent, and synced
+  // history).
+  sentByUserId        String?
+  // How the AI was involved in producing this message (NONE/ASSIST/AUTO).
+  aiMode              AiMode           @default(NONE)
+  // Set when this message is a PPV offer.
+  ppvPriceCents       Int?
+  sentAt              DateTime         @default(now())
+  externalRef         String?
+  originAgentActionId String?          @unique
+
+  agency             Agency            @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  conversation       Conversation      @relation(fields: [agencyId, conversationId], references: [agencyId, id], onDelete: Cascade)
+  sentBy             User?             @relation("MessageSender", fields: [agencyId, sentByUserId], references: [agencyId, id], onDelete: Restrict)
+  originAgentAction  AgentAction?      @relation("AgentActionMessage", fields: [agencyId, originAgentActionId], references: [agencyId, id], onDelete: Restrict)
+  triggeredAgentRuns AgentRun[]        @relation("AgentRunTriggerMessage")
+  vaultSend          VaultSend?
+  outboundDelivery   OutboundDelivery?
+  contentRequests    ContentRequest[]
+
+  @@unique([conversationId, externalRef])
+  @@unique([agencyId, id])
+  @@unique([agencyId, originAgentActionId])
+  @@index([agencyId])
+  @@index([conversationId, sentAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Money
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum TransactionType {
+  SUBSCRIPTION
+  PPV
+  TIP
+}
+
+model Transaction {
+  id                  String          @id @default(cuid())
+  agencyId            String
+  creatorAccountId    String
+  fanId               String
+  type                TransactionType
+  amountCents         Int
+  // Which chatter closed the sale (null for organic/subscription revenue).
+  closedByUserId      String?
+  shiftId             String?
+  vaultSendId         String?         @unique
+  // AI involvement in the PPV/offer that produced this sale. The tiered
+  // commission (7% ASSIST / 9% AUTO) is computed on this — see
+  // src/domain/commission.ts.
+  aiMode              AiMode          @default(NONE)
+  occurredAt          DateTime
+  externalRef         String?
+  currency            String          @default("USD")
+  providerMessageRef  String?
+  originAgentActionId String?         @unique
+
+  agency            Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount    CreatorAccount @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  fan               Fan            @relation(fields: [agencyId, fanId], references: [agencyId, id], onDelete: Cascade)
+  closedBy          User?          @relation("TransactionCloser", fields: [agencyId, closedByUserId], references: [agencyId, id], onDelete: Restrict)
+  shift             Shift?         @relation(fields: [agencyId, shiftId], references: [agencyId, id], onDelete: Restrict)
+  vaultSend         VaultSend?     @relation(fields: [agencyId, vaultSendId], references: [agencyId, id], onDelete: Restrict)
+  originAgentAction AgentAction?   @relation("AgentActionTransaction", fields: [agencyId, originAgentActionId], references: [agencyId, id], onDelete: Restrict)
+
+  @@unique([creatorAccountId, externalRef])
+  @@unique([creatorAccountId, fanId, providerMessageRef])
+  @@unique([agencyId, vaultSendId])
+  @@unique([agencyId, originAgentActionId])
+  @@index([agencyId])
+  @@index([creatorAccountId, occurredAt])
+  @@index([fanId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Vault (metadata only — no media files in MVP)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum MediaType {
+  PHOTO
+  VIDEO
+  AUDIO
+  BUNDLE
+}
+
+enum VaultItemPlatformStatus {
+  UNKNOWN
+  PROCESSING
+  READY
+  ERROR
+  UNAVAILABLE
+}
+
+model CreatorSalesProfile {
+  id                      String      @id @default(cuid())
+  agencyId                String
+  creatorAccountId        String
+  persona                 String      @db.Text
+  kbText                  String      @db.Text
+  language                String
+  timezone                String
+  businessHours           Json
+  defaultControlMode      ControlMode @default(ASSIST)
+  maxFollowUps            Int         @default(2)
+  globalPriceCapCents     Int
+  stylePreset             String      @default("BALANCED")
+  firstMessage            String      @default("") @db.Text
+  ownerInstructions       String      @default("") @db.Text
+  draftConfig             Json?
+  previousPublishedConfig Json?
+  draftUpdatedAt          DateTime?
+  publishedAt             DateTime?
+  version                 Int         @default(1)
+  createdAt               DateTime    @default(now())
+  updatedAt               DateTime    @updatedAt
+
+  agency         Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount CreatorAccount @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, creatorAccountId])
+  @@index([agencyId])
+}
+
+model VaultPriceGroup {
+  id                 String   @id @default(cuid())
+  agencyId           String
+  creatorAccountId   String
+  name               String
+  basePriceCents     Int
+  minPriceCents      Int
+  maxPriceCents      Int
+  priceMode          String   @default("FIXED")
+  maxDiscountPercent Int      @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  agency         Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount CreatorAccount @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  items          VaultItem[]
+
+  @@unique([agencyId, id])
+  @@unique([creatorAccountId, name])
+  @@index([agencyId, creatorAccountId])
+}
+
+model VaultItem {
+  id                   String                  @id @default(cuid())
+  agencyId             String
+  creatorAccountId     String
+  priceGroupId         String?
+  title                String
+  mediaType            MediaType
+  defaultPriceCents    Int
+  tags                 String[]                @default([])
+  externalRef          String?
+  active               Boolean                 @default(false)
+  platformStatus       VaultItemPlatformStatus @default(UNKNOWN)
+  minPriceCents        Int?
+  maxPriceCents        Int?
+  approvedPriceCents   Int?
+  priceMode            String                  @default("FIXED")
+  maxDiscountPercent   Int                     @default(0)
+  priceOverrideEnabled Boolean                 @default(false)
+  lastVerifiedAt       DateTime?
+  createdAt            DateTime                @default(now())
+
+  agency         Agency           @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount CreatorAccount   @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  priceGroup     VaultPriceGroup? @relation(fields: [agencyId, priceGroupId], references: [agencyId, id], onDelete: Restrict)
+  sends          VaultSend[]
+
+  @@unique([creatorAccountId, externalRef])
+  @@unique([agencyId, id])
+  @@index([agencyId])
+  @@index([creatorAccountId])
+  @@index([creatorAccountId, active, platformStatus])
+  @@index([agencyId, priceGroupId])
+}
+
+model VaultSend {
+  id                  String    @id @default(cuid())
+  agencyId            String
+  vaultItemId         String
+  fanId               String
+  messageId           String?   @unique
+  sentByUserId        String?
+  // How the AI was involved in this PPV offer (NONE/ASSIST/AUTO).
+  aiMode              AiMode    @default(NONE)
+  priceCents          Int
+  sentAt              DateTime  @default(now())
+  purchasedAt         DateTime?
+  originAgentActionId String?   @unique
+
+  agency            Agency            @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  vaultItem         VaultItem         @relation(fields: [agencyId, vaultItemId], references: [agencyId, id], onDelete: Cascade)
+  fan               Fan               @relation(fields: [agencyId, fanId], references: [agencyId, id], onDelete: Cascade)
+  message           Message?          @relation(fields: [agencyId, messageId], references: [agencyId, id], onDelete: Restrict)
+  sentBy            User?             @relation(fields: [agencyId, sentByUserId], references: [agencyId, id], onDelete: Restrict)
+  originAgentAction AgentAction?      @relation("AgentActionVaultSend", fields: [agencyId, originAgentActionId], references: [agencyId, id], onDelete: Restrict)
+  transaction       Transaction?
+  outboundDelivery  OutboundDelivery?
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, messageId])
+  @@unique([agencyId, originAgentActionId])
+  @@index([agencyId])
+  @@index([fanId, vaultItemId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI decision/action attribution
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum AgentRunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum AgentActionKind {
+  SELECT_OFFER
+  SEND_TEXT
+  SEND_PPV
+  CHECK_PURCHASE
+  UPDATE_SALES_STATE
+  SCHEDULE_FOLLOW_UP
+  CANCEL_FOLLOW_UP
+  HANDOFF_TO_HUMAN
+}
+
+enum AgentActionStatus {
+  PROPOSED
+  APPROVED
+  EXECUTING
+  COMPLETED
+  DENIED
+  FAILED
+  CANCELED
+}
+
+enum SalesEventType {
+  STAGE_CHANGED
+  OFFER_SELECTED
+  OFFER_SENT
+  OBJECTION_RECORDED
+  HANDOFF
+  PURCHASED
+  LOST
+}
+
+model AgentRun {
+  id                  String         @id @default(cuid())
+  agencyId            String
+  conversationId      String
+  inboundEventId      String
+  triggerMessageId    String?
+  status              AgentRunStatus @default(RUNNING)
+  decision            Json?
+  errorCode           String?
+  salesProfileVersion Int?
+  // E1.2 provider trace. Prompts and credentials are deliberately not stored.
+  shadowOnly          Boolean        @default(false)
+  copilotProvider     String?
+  copilotModel        String?
+  providerRequestId   String?
+  llmInputTokens      Int?
+  llmOutputTokens     Int?
+  reservedCostMicros  Int?
+  startedAt           DateTime       @default(now())
+  completedAt         DateTime?
+  createdAt           DateTime       @default(now())
+  updatedAt           DateTime       @updatedAt
+
+  agency         Agency        @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  conversation   Conversation  @relation(fields: [agencyId, conversationId], references: [agencyId, id], onDelete: Cascade)
+  inboundEvent   InboundEvent  @relation(fields: [agencyId, inboundEventId], references: [agencyId, id], onDelete: Cascade)
+  triggerMessage Message?      @relation("AgentRunTriggerMessage", fields: [agencyId, triggerMessageId], references: [agencyId, id], onDelete: Restrict)
+  actions        AgentAction[]
+  salesEvents    SalesEvent[]
+  followUpJobs   FollowUpJob[]
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, inboundEventId])
+  @@index([agencyId, conversationId, createdAt])
+  @@index([agencyId, status, createdAt])
+  @@index([agencyId, shadowOnly, createdAt])
+}
+
+model AgentAction {
+  id              String            @id @default(cuid())
+  agencyId        String
+  agentRunId      String
+  conversationId  String
+  clientRequestId String
+  kind            AgentActionKind
+  status          AgentActionStatus @default(PROPOSED)
+  input           Json?
+  result          Json?
+  reasonCode      String?
+  executedAt      DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  agency               Agency        @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  agentRun             AgentRun      @relation(fields: [agencyId, agentRunId], references: [agencyId, id], onDelete: Cascade)
+  conversation         Conversation  @relation(fields: [agencyId, conversationId], references: [agencyId, id], onDelete: Cascade)
+  message              Message?      @relation("AgentActionMessage")
+  vaultSend            VaultSend?    @relation("AgentActionVaultSend")
+  transaction          Transaction?  @relation("AgentActionTransaction")
+  salesEvents          SalesEvent[]
+  sourceFollowUpJobs   FollowUpJob[] @relation("FollowUpSourceAction")
+  followUpExecutionJob FollowUpJob?  @relation("FollowUpExecutionAction")
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, clientRequestId])
+  @@index([agencyId, agentRunId, createdAt])
+  @@index([agencyId, conversationId, status])
+}
+
+model SalesEvent {
+  id             String         @id @default(cuid())
+  agencyId       String
+  conversationId String
+  agentRunId     String?
+  agentActionId  String?
+  type           SalesEventType
+  stageFrom      SalesStage?
+  stageTo        SalesStage?
+  metadata       Json?
+  dedupeKey      String
+  occurredAt     DateTime       @default(now())
+  createdAt      DateTime       @default(now())
+
+  agency       Agency       @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [agencyId, conversationId], references: [agencyId, id], onDelete: Cascade)
+  agentRun     AgentRun?    @relation(fields: [agencyId, agentRunId], references: [agencyId, id], onDelete: Restrict)
+  agentAction  AgentAction? @relation(fields: [agencyId, agentActionId], references: [agencyId, id], onDelete: Restrict)
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, dedupeKey])
+  @@index([agencyId, conversationId, occurredAt])
+  @@index([agencyId, type, occurredAt])
+}
+
+// Durable, one-at-a-time follow-up work. Jobs never call a platform adapter
+// directly: the worker creates an AgentAction and re-enters policy + outbox.
+enum FollowUpJobStatus {
+  PENDING
+  PROCESSING
+  RETRY
+  COMPLETED
+  CANCELED
+  DLQ
+}
+
+model FollowUpJob {
+  id                  String            @id @default(cuid())
+  agencyId            String
+  creatorAccountId    String
+  conversationId      String
+  sourceAgentRunId    String
+  sourceAgentActionId String
+  agentActionId       String?           @unique
+  sequence            Int
+  runAt               DateTime
+  status              FollowUpJobStatus @default(PENDING)
+  dedupeKey           String
+  reason              String
+  body                String            @db.Text
+  cancelReason        String?
+  attemptCount        Int               @default(0)
+  maxAttempts         Int               @default(5)
+  nextAttemptAt       DateTime
+  leaseOwner          String?
+  leaseUntil          DateTime?
+  lastErrorCode       String?
+  lastErrorAt         DateTime?
+  completedAt         DateTime?
+  canceledAt          DateTime?
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  agency               Agency              @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount       CreatorAccount      @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  conversation         Conversation        @relation(fields: [agencyId, conversationId], references: [agencyId, id], onDelete: Cascade)
+  sourceAgentRun       AgentRun            @relation(fields: [agencyId, sourceAgentRunId], references: [agencyId, id], onDelete: Cascade)
+  sourceAgentAction    AgentAction         @relation("FollowUpSourceAction", fields: [agencyId, sourceAgentActionId], references: [agencyId, id], onDelete: Cascade)
+  agentAction          AgentAction?        @relation("FollowUpExecutionAction", fields: [agencyId, agentActionId], references: [agencyId, id], onDelete: Restrict)
+  platformConnection   PlatformConnection? @relation(fields: [agencyId, platformConnectionId], references: [agencyId, id], onDelete: Restrict)
+  platformConnectionId String?
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, dedupeKey])
+  @@unique([agencyId, agentActionId])
+  @@index([agencyId, status, nextAttemptAt])
+  @@index([agencyId, conversationId, status])
+  @@index([agencyId, creatorAccountId, status])
+  @@index([agencyId, platformConnectionId])
+  @@index([leaseUntil])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Durable outbound delivery
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum OutboundDeliveryKind {
+  TEXT
+  PPV
+}
+
+enum OutboundDeliveryStatus {
+  PENDING
+  PROCESSING
+  CONFIRMING
+  SENT
+  RETRY
+  FAILED
+  DLQ
+  CANCELED
+}
+
+enum OutboundAttemptOutcome {
+  SENT
+  RETRYABLE
+  PERMANENT
+  AMBIGUOUS
+}
+
+model OutboundDelivery {
+  id                  String                 @id @default(cuid())
+  agencyId            String
+  creatorAccountId    String
+  connectionId        String
+  conversationId      String
+  fanId               String
+  messageId           String                 @unique
+  vaultSendId         String?                @unique
+  clientRequestId     String
+  kind                OutboundDeliveryKind
+  status              OutboundDeliveryStatus @default(PENDING)
+  attemptCount        Int                    @default(0)
+  maxAttempts         Int                    @default(5)
+  nextAttemptAt       DateTime               @default(now())
+  leaseOwner          String?
+  leaseUntil          DateTime?
+  providerExternalRef String?
+  lastErrorCode       String?
+  lastErrorAt         DateTime?
+  sentAt              DateTime?
+  createdAt           DateTime               @default(now())
+  updatedAt           DateTime               @updatedAt
+
+  agency          Agency                    @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creatorAccount  CreatorAccount            @relation(fields: [agencyId, creatorAccountId], references: [agencyId, id], onDelete: Cascade)
+  connection      PlatformConnection        @relation(fields: [agencyId, connectionId], references: [agencyId, id], onDelete: Cascade)
+  conversation    Conversation              @relation(fields: [agencyId, conversationId], references: [agencyId, id], onDelete: Cascade)
+  fan             Fan                       @relation(fields: [agencyId, fanId], references: [agencyId, id], onDelete: Cascade)
+  message         Message                   @relation(fields: [agencyId, messageId], references: [agencyId, id], onDelete: Cascade)
+  vaultSend       VaultSend?                @relation(fields: [agencyId, vaultSendId], references: [agencyId, id], onDelete: Cascade)
+  attempts        OutboundDeliveryAttempt[]
+  desktopCommands DesktopConnectorCommand[]
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, clientRequestId])
+  @@unique([agencyId, messageId])
+  @@unique([agencyId, vaultSendId])
+  @@index([agencyId, status, nextAttemptAt])
+  @@index([status, nextAttemptAt])
+  @@index([leaseUntil])
+}
+
+model OutboundDeliveryAttempt {
+  id         String                 @id @default(cuid())
+  agencyId   String
+  deliveryId String
+  number     Int
+  outcome    OutboundAttemptOutcome
+  errorCode  String?
+  httpStatus Int?
+  startedAt  DateTime
+  finishedAt DateTime               @default(now())
+
+  agency   Agency           @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  delivery OutboundDelivery @relation(fields: [agencyId, deliveryId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([agencyId, deliveryId, number])
+  @@index([agencyId, finishedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit
+// ─────────────────────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id              String    @id @default(cuid())
+  agencyId        String
+  actorId         String?
+  action          String // e.g. "message.send", "ppv.send", "vault.price.update"
+  entityType      String
+  entityId        String?
+  before          Json?
+  after           Json?
+  createdAt       DateTime  @default(now())
+  tenantDeletedAt DateTime?
+
+  // Deliberately no foreign keys: audit history must outlive tenant/user rows.
+  // Migration 0009 anonymizes the identifying fields before an Agency delete.
+
+  @@index([agencyId, createdAt])
+  @@index([agencyId, action])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SaaS billing (our billing of the agency)
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum SaasSubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+}
+
+model SaasSubscription {
+  id                 String                 @id @default(cuid())
+  agencyId           String                 @unique
+  status             SaasSubscriptionStatus @default(TRIALING)
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  // Reference inside the payment provider (mock for MVP, Stripe later).
+  providerRef        String?
+  createdAt          DateTime               @default(now())
+
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+}
+
+enum BillingRecordStatus {
+  DRAFT
+  INVOICED
+  PAID
+  FAILED
+}
+
+enum CryptoPaymentStatus {
+  CREATED
+  SUBMITTED
+  VERIFYING
+  CONFIRMED
+  REJECTED
+  EXPIRED
+}
+
+model BillingRecord {
+  id          String              @id @default(cuid())
+  agencyId    String
+  periodStart DateTime
+  periodEnd   DateTime
+  amountCents Int
+  // Per-period breakdown. Never store chat text or payment-provider secrets.
+  lineItems   Json
+  status      BillingRecordStatus @default(DRAFT)
+  dueAt       DateTime?
+  graceEndsAt DateTime?
+  paidAt      DateTime?
+  currency    String              @default("USD")
+  network     String?
+  txHash      String?
+  createdAt   DateTime            @default(now())
+
+  agency         Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  cryptoPayments CryptoPayment[]
+
+  @@unique([agencyId, id])
+  @@unique([agencyId, periodStart, periodEnd])
+  @@index([agencyId, periodEnd, status])
+}
+
+model CryptoPayment {
+  id                    String              @id @default(cuid())
+  agencyId              String
+  billingRecordId       String?
+  asset                 String
+  network               String
+  address               String
+  amountCents           Int
+  assetAmount           String
+  txHash                String?
+  status                CryptoPaymentStatus @default(CREATED)
+  confirmations         Int                 @default(0)
+  requiredConfirmations Int                 @default(1)
+  expiresAt             DateTime
+  submittedAt           DateTime?
+  confirmedAt           DateTime?
+  lastErrorCode         String?
+  createdAt             DateTime            @default(now())
+  updatedAt             DateTime            @updatedAt
+
+  agency        Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  billingRecord BillingRecord? @relation(fields: [agencyId, billingRecordId], references: [agencyId, id], onDelete: Restrict)
+
+  @@unique([agencyId, id])
+  @@unique([network, txHash])
+  @@index([agencyId, status, expiresAt])
+  @@index([agencyId, billingRecordId])
+}

@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+/* Dark by default: operators often work long evening shifts. */
+@theme {
+  --color-background: #08080c;
+  --color-surface: #111116;
+  --color-surface-2: #18181f;
+  --color-surface-3: #202028;
+  --color-border: #292932;
+  --color-border-strong: #383844;
+  --color-foreground: #f3f2f7;
+  --color-muted: #9693a2;
+  --color-primary: #9b7af8;
+  --color-primary-hover: #8b5cf6;
+  --color-primary-foreground: #ffffff;
+  --color-success: #34d399;
+  --color-warning: #fbbf24;
+  --color-danger: #f87171;
+  --color-whale: #38bdf8;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+html {
+  color-scheme: dark;
+  background: var(--color-background);
+  scroll-behavior: smooth;
+}
+
+body {
+  min-width: 320px;
+  background:
+    radial-gradient(circle at 84% -8%, rgba(124, 58, 237, 0.12), transparent 31rem),
+    radial-gradient(circle at -10% 45%, rgba(56, 189, 248, 0.055), transparent 28rem),
+    var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-primary) 40%, transparent);
+}
+
+:focus-visible {
+  outline: none;
+}
+
+a,
+button,
+input,
+textarea,
+select {
+  -webkit-tap-highlight-color: transparent;
+}
+
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--color-foreground);
+  box-shadow: 0 0 0 1000px var(--color-surface-2) inset;
+  transition: background-color 9999s ease-in-out 0s;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
