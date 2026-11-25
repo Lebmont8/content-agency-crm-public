@@ -1,6 +1,6 @@
 # Content Agency CRM — public source edition
 
-A real multi-tenant Next.js/TypeScript CRM code edition, not a simulated dashboard. It includes authentication, tenant isolation, contacts, manual inbox operations, content metadata, shifts, KPI, audit trails and official platform-adapter infrastructure. External sends remain fail-closed until an operator supplies and reviews their own transport configuration.
+Manage contacts, handle inboxes manually, and track content, shifts, and KPIs across separate workspaces. This Next.js edition includes sign-in, tenant isolation, audit logs, and a framework for official platform adapters. It does not send messages to external services until you configure and review your own connection.
 
 ## Publication boundary
 The commercial AI conversation system is NOT distributed. The separate desktop client and internal QA fixtures are not part of this edition. No private instructions, response templates, persona examples, conversation playbooks, automatic sales decisions, adaptive pricing, internal fixtures, mock conversation datasets or original repository history are included. Compatibility boundaries explicitly reject automation requests. The private production product is not modified by this edition.
